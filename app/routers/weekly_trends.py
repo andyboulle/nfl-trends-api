@@ -1,0 +1,1292 @@
+import time
+from sqlalchemy.sql import func
+from itertools import permutations
+from sqlalchemy.orm import Session
+from sqlalchemy import case, and_, or_
+from sqlalchemy.inspection import inspect
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Union, Literal
+from fastapi import APIRouter, HTTPException, Depends
+from app.models.weekly_trend import WeeklyTrend
+from app.database.connection import get_connection
+from app.enums.trend_enums import CategoryEnum, MonthEnum, DayOfWeekEnum
+
+router = APIRouter()
+
+# Cache for weekly filter options to avoid frequent DB queries
+_weekly_options_cache = {
+    "data": None,
+    "timestamp": 0,
+    "ttl": 300  # 5 minutes TTL
+}
+
+MONTH_MAPPING = {
+    "January": 1,
+    "February": 2,
+    "March": 3,
+    "April": 4,
+    "May": 5,
+    "June": 6,
+    "July": 7,
+    "August": 8,
+    "September": 9,
+    "October": 10,
+    "November": 11,
+    "December": 12,
+}
+
+##################################
+######## FILTER OBJECTS ##########
+##################################
+
+class SortField(BaseModel):
+    field: str
+    order: Literal["asc", "desc"] = "asc"
+
+class SpreadFilter(BaseModel):
+    exact: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        description="List of exact spread strings to match, e.g. ['7.0', '10.5']"
+    )
+    or_less: Optional[Union[int, List[int]]] = Field(
+        default=None,
+        description="Filter for 'X or less' spread values, e.g. 3 → '3 or less' or [10, 11, 12] → ['10 or less', '11 or less', '12 or less']"
+    )
+    or_more: Optional[Union[int, List[int]]] = Field(
+        default=None,
+        description="Filter for 'X or more' spread values, e.g. 10 → '10 or more' or [7, 8, 9] → ['7 or more', '8 or more', '9 or more']"
+    )
+
+class TotalFilter(BaseModel):
+    exact: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        description="List of exact total strings to match, e.g. ['45 or less', '50 or more']"
+    )
+    or_less: Optional[Union[int, List[int]]] = Field(
+        default=None,
+        description="Filter for 'X or less' total values, must be 30–60 in steps of 5, e.g. 50 → '50 or less' or [35, 40, 45] → ['35 or less', '40 or less', '45 or less']"
+    )
+    or_more: Optional[Union[int, List[int]]] = Field(
+        default=None,
+        description="Filter for 'X or more' total values, must be 30–60 in steps of 5, e.g. 40 → '40 or more' or [35, 40, 45] → ['35 or more', '40 or more', '45 or more']"
+    )
+
+class GamesApplicableFilter(BaseModel):
+    games: Union[str, List[str]] = Field(
+        ...,
+        description=(
+            "Games to filter by. Can be a single game string or a list of game strings. "
+            "Game format: 'HOMEABBREVvsAWAYABBREV' (e.g., 'PHIvsDAL', 'CLEvsCIN'). "
+            "Examples: 'PHIvsDAL' or ['PHIvsDAL', 'CLEvsCIN'] or 'PHIvsDAL, CLEvsCIN'."
+        )
+    )
+    match_mode: Literal["contains_any", "contains_all", "exact", "excludes_any"] = Field(
+        "contains_all",
+        description=(
+            "How to match games filter: "
+            "'contains_any' - match if any specified games are in the trend's games list, "
+            "'contains_all' - match if all specified games are in the trend's games list (default), "
+            "'exact' - exact match of the entire games list, "
+            "'excludes_any' - match trends that do NOT contain any of the specified games."
+        )
+    )
+
+    @validator("games", pre=True)
+    def validate_games(cls, value):
+        def validate_game_format(game: str) -> str:
+            if not isinstance(game, str):
+                raise ValueError("Game must be a string")
+            
+            game = game.strip()
+            if not game:
+                raise ValueError("Game cannot be empty")
+            
+            if 'vs' not in game:
+                raise ValueError("Game must be in format 'HOMEvsAWAY' (e.g., 'PHIvsDAL')")
+            
+            parts = game.split('vs')
+            if len(parts) != 2:
+                raise ValueError("Game must have exactly one 'vs' separator")
+            
+            home_team, away_team = parts[0].strip(), parts[1].strip()
+            
+            if not home_team or not away_team:
+                raise ValueError("Both home and away teams must be specified")
+            
+            if len(home_team) < 2 or len(home_team) > 4:
+                raise ValueError("Team abbreviations must be 2-4 characters")
+            
+            if len(away_team) < 2 or len(away_team) > 4:
+                raise ValueError("Team abbreviations must be 2-4 characters")
+            
+            return game
+
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            # Handle comma-separated string
+            if ',' in value:
+                games = [g.strip() for g in value.split(',')]
+                return [validate_game_format(game) for game in games if game]
+            else:
+                return [validate_game_format(value)]
+        
+        elif isinstance(value, list):
+            validated_games = []
+            for game in value:
+                if not isinstance(game, str):
+                    raise ValueError("All games in list must be strings")
+                validated_games.append(validate_game_format(game))
+            return validated_games
+        
+        raise ValueError("games must be a string or list of strings")
+
+class SeasonFilter(BaseModel):
+    exact: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        description="Exact seasons string(s), e.g. 'since 2015-2016'"
+    )
+    since_or_later: Optional[str] = Field(
+        default=None,
+        description="Return trends from this seasons and later"
+    )
+    since_or_earlier: Optional[str] = Field(
+        default=None,
+        description="Return trends from this seasons and earlier"
+    )
+
+class WeeklyTrendFilter(BaseModel):
+
+    ##################################
+    ###### PAGINATION FILTERS ########
+    ##################################
+
+    limit: Optional[int] = Field(
+        5000,
+        description=(
+            "Limit the number of results returned. "
+            "Example: 100."
+        )
+    )
+    offset: Optional[int] = Field(
+        0,
+        description=(
+            "Offset the results returned. "
+            "Example: 0."
+        )
+    )
+
+    # VALIDATE LIMIT is between 1 and 5000000
+    @validator("limit", pre=True)
+    def validate_limit(cls, value):
+        if not isinstance(value, int) or not (1 <= value <= 5000000):
+            raise ValueError("Limit must be an integer between 1 and 5000000")
+        return value
+    # VALIDATE OFFSET is greater than 0
+    @validator("offset", pre=True)
+    def validate_offset(cls, value):
+        if not isinstance(value, int) or value < 0:
+            raise ValueError("Offset must be an integer greater than or equal to 0")
+        return value
+    
+    ##################################
+    ######## TREND ID FILTERS ########
+    ##################################
+
+    trend_id: Optional[Union[str, List[str]]] = Field(
+        None,
+        description=(
+            "Filter by trend ID(s). The format is either a list of strings or a single string of comma separated values of filters for trends in the following order:" \
+            "category,month,day of week,divisional,spread,total,seasons since."
+            "Example: 'home ats,October,Thursday,False,8 or less,40 or less,since 2008-2009'."
+        )
+    )
+
+    # VALIDATE TREND IDs are in a comma separated list of filters
+    @validator("trend_id", pre=True)
+    def validate_trend_id(cls, value):
+        if value is None:
+            return value
+
+        if isinstance(value, str):
+            values = [v.strip() for v in value.split(",")]
+            if len(values) != 7:
+                raise ValueError(
+                    "If trend_id is a string, it must have exactly 7 comma-separated values."
+                )
+            print("TREND ID is a single string.")
+            return value
+
+        elif isinstance(value, list):
+            for v in value:
+                if not isinstance(v, str):
+                    raise ValueError("All items in trend_id list must be strings.")
+                values = [x.strip() for x in v.split(",")]
+                if len(values) != 7:
+                    raise ValueError(
+                        f"Each trend_id in the list must have exactly 7 comma-separated values. Got: {values}"
+                    )
+            print("TREND ID is a list of strings.")
+            return value
+
+        raise ValueError("trend_id must be either a string or a list of strings.")
+    
+
+    ####################################
+    ####### CATEGORY FILTERS ###########
+    ####################################
+
+    category: Optional[Union[str, List[str]]] = Field(
+        None,
+        description=(
+            "Filter by category. Can be a single category or a list of categories from the following options:" \
+            "home outright, away outright, favorite outright, underdog outright, home favorite outright, away underdog outright, away favorite outright, home underdog outright, home ats, away ats, favorite ats, underdog ats, home favorite ats, away underdog ats, away favorite ats, home underdog ats, over, under." \
+            "Example: 'home ats' or ['home outright, away outright']."
+        )
+    )
+
+    # VALIDATE CATEGORY is in the CategoryEnum format
+    @validator("category", pre=True)
+    def validate_category(cls, value):
+        if value is None:
+            return value
+
+        if isinstance(value, str):
+            # Validate a single category
+            value = value.lower()
+            if value not in CategoryEnum._value2member_map_:
+                raise ValueError(
+                    f"Invalid category: {value}. Must be one of {list(CategoryEnum._value2member_map_.keys())}."
+                )
+        if isinstance(value, list):
+            # Validate a list of categories
+            for v in value:
+                v = v.lower()
+                if v not in CategoryEnum._value2member_map_:
+                    raise ValueError(
+                        f"Invalid category: {v}. Must be one of {list(CategoryEnum._value2member_map_.keys())}."
+                    )
+        return value
+    
+
+    ############################
+    ####### MONTH FILTERS ######
+    ############################
+
+    month: Optional[Union[str, List[str]]] = Field(
+        None,
+        description=(
+            "Filter by month. Can be a single month, a list of months, or 'None' (as a string to filter for NULL values). "
+            "Example: 'January' or ['January', 'February'] or 'None'."
+        )
+    )
+    start_month: Optional[str] = Field(
+        None,
+        description="Start month for filtering trends. Example: 'January'."
+    )
+    end_month: Optional[str] = Field(
+        None,
+        description="End month for filtering trends. Example: 'December'."
+    )
+
+    # VALIDATES MONTHS are in the MonthEnum format
+    @validator("month", pre=True)
+    def validate_month(cls, value):
+        if value == "None":
+            return "None"
+        if isinstance(value, str):
+            value = value.capitalize()
+            if value not in MonthEnum._value2member_map_:
+                raise ValueError(f"{value} must be one of {list(MonthEnum._value2member_map_.keys())} or 'None'")
+            return value
+        if isinstance(value, list):
+            normalized = []
+            for v in value:
+                v_cap = v.capitalize() if isinstance(v, str) else v
+                if v_cap != "None" and v_cap not in MonthEnum._value2member_map_:
+                    raise ValueError(f"Each month in {value} must be one of {list(MonthEnum._value2member_map_.keys())} or 'None'")
+                normalized.append(v_cap)
+            return normalized
+        return value
+    
+    @validator("start_month", "end_month", pre=True)
+    def validate_start_end_month(cls, value):
+        if value == "None":
+            raise ValueError(f"{value} cannot be 'None'")
+        if isinstance(value, str):
+            value = value.capitalize()
+            if value not in MonthEnum._value2member_map_:
+                raise ValueError(f"{value} must be one of {list(MonthEnum._value2member_map_.keys())}")
+            return value
+        return value
+    
+
+    ###############################
+    ##### DAY OF WEEK FILTERS #####
+    ###############################
+
+    day_of_week: Optional[Union[str, List[str]]] = Field(
+        None,
+        description=(
+            "Filter by day of the week. Can be a single day, a list of days, or 'None' (as a string to filter for NULL values). "
+            "Example: 'Monday' or ['Monday', 'Tuesday'] or 'None'."
+        )
+    )
+    
+    # VALIDATE DAY OF WEEK are in the DayOfWeekEnum format
+    @validator("day_of_week", pre=True)
+    def validate_day_of_week(cls, value):
+        valid_days = set(DayOfWeekEnum._value2member_map_.keys())
+
+        def is_valid_day(day):
+            return day in valid_days or day == "None"
+
+        if isinstance(value, str):
+            value = value.capitalize()
+            if not is_valid_day(value):
+                raise ValueError(f"{value} must be one of {list(valid_days)} or 'None'")
+            return value
+
+        if isinstance(value, list):
+            value = [str(day).capitalize() if isinstance(day, str) else day for day in value]
+            for day in value:
+                if not is_valid_day(day):
+                    raise ValueError(f"Each day in {value} must be one of {list(valid_days)} or 'None'")
+            return value
+
+        return value
+    
+
+    ###########################
+    ### DIVISIONAL FILTERS ####
+    ###########################
+
+    divisional: Optional[Union[bool, Literal["None"]]] = Field(
+        None,
+        description="Filter for divisional trends. Can be True, False, or 'None' (as a string to filter for NULL values)."
+    )
+
+    # VALIDATE DIVISIONAL is a boolean or "None"
+    @validator("divisional", pre=True)
+    def validate_divisional(cls, value):
+        if value == "None":
+            return "None"
+        if isinstance(value, str):
+            if value.lower() == "true":
+                return True
+            if value.lower() == "false":
+                return False
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        raise ValueError("Divisional must be True, False, or 'None' (as a string)")
+    
+
+    #################################
+    ####### SPREAD FILTERS ##########
+    #################################
+
+    spread: Optional[Union[SpreadFilter, str]] = Field(
+        None,
+        description=(
+            "Filter by spread. Can be 'None' to get rows where spread is null, or a structured filter like "
+            "{'exact': '3.0'} or {'or_more': 6} or {'or_less': 10} or {'or_more': [7, 8, 9]} or {'or_less': [10, 11, 12]} or "
+            "{'exact': ['7.5', '1.5'], 'or_more': 12} or "
+            "{'exact': ['7.0', '10.5'], 'or_less': [3, 4], 'or_more': [10, 11]}"
+        )
+    )
+
+    # VALIDATE SPREAD is in the SPREAD_VALUES format
+    @validator("spread")
+    def validate_spread(cls, spread):
+        if spread:
+            SPREAD_VALUES = {f"{x:.1f}" for x in [i * 0.5 for i in range(0, 55)]}
+            SPREAD_VALUES.update({f"{i} or less" for i in range(1, 15)})
+            SPREAD_VALUES.update({f"{i} or more" for i in range(1, 15)})
+            SPREAD_VALUES.add("None")
+
+            if isinstance(spread, str):
+                if spread == "None":
+                    return "None"
+                raise ValueError(
+                    f"Invalid spread value: '{spread}'. Allowed values are structured objects or the string 'None'."
+                )
+
+            elif isinstance(spread, SpreadFilter):
+                # exact values
+                if spread.exact:
+                    exact_list = [spread.exact] if isinstance(spread.exact, str) else spread.exact
+                    for val in exact_list:
+                        if val not in SPREAD_VALUES:
+                            raise ValueError(
+                                f"Invalid spread value in 'exact': '{val}'. Allowed: '0.0'-'27.0' by 0.5, 'X or less/more' (1-14), or 'None'."
+                            )
+
+                # or_less values - can be int or list of ints
+                if spread.or_less is not None:
+                    or_less_list = [spread.or_less] if isinstance(spread.or_less, int) else spread.or_less
+                    for val in or_less_list:
+                        if not (1 <= val <= 14):
+                            raise ValueError(f"'or_less' value {val} must be between 1 and 14")
+
+                # or_more values - can be int or list of ints
+                if spread.or_more is not None:
+                    or_more_list = [spread.or_more] if isinstance(spread.or_more, int) else spread.or_more
+                    for val in or_more_list:
+                        if not (1 <= val <= 14):
+                            raise ValueError(f"'or_more' value {val} must be between 1 and 14")
+
+        return spread
+    
+
+    #################################
+    ####### TOTAL FILTERS ###########
+    #################################
+
+    total: Optional[Union[TotalFilter, str]] = Field(
+        None,
+        description=(
+            "Filter by total. Can be 'None' for null totals, or a filter like "
+            "{'exact': '45 or more'} or {'or_less': 50} or {'or_more': [35, 40]} or {'or_less': [45, 50]} or "
+            "{'exact': ['30 or more', '40 or less'], 'or_more': 55}, etc."
+        )
+    )
+
+    @validator("total")
+    def validate_total(cls, total):
+        if total:
+            TOTAL_VALUES = {f"{i} or less" for i in range(30, 65, 5)}
+            TOTAL_VALUES.update({f"{i} or more" for i in range(30, 65, 5)})
+            TOTAL_VALUES.add("None")
+
+            if isinstance(total, str):
+                if total == "None":
+                    return "None"
+                raise ValueError(
+                    f"Invalid total value: '{total}'. Allowed values are structured filters or 'None'."
+                )
+
+            elif isinstance(total, TotalFilter):
+                if total.exact:
+                    exact_list = [total.exact] if isinstance(total.exact, str) else total.exact
+                    for val in exact_list:
+                        if val not in TOTAL_VALUES:
+                            raise ValueError(
+                                f"Invalid total value in 'exact': '{val}'. Allowed values: 30–60 in steps of 5 for 'X or less'/'X or more', or 'None'."
+                            )
+
+                # or_less values - can be int or list of ints
+                if total.or_less is not None:
+                    or_less_list = [total.or_less] if isinstance(total.or_less, int) else total.or_less
+                    for val in or_less_list:
+                        if val not in range(30, 65, 5):
+                            raise ValueError(f"'or_less' value {val} must be one of: 30, 35, 40, 45, 50, 55, 60")
+
+                # or_more values - can be int or list of ints
+                if total.or_more is not None:
+                    or_more_list = [total.or_more] if isinstance(total.or_more, int) else total.or_more
+                    for val in or_more_list:
+                        if val not in range(30, 65, 5):
+                            raise ValueError(f"'or_more' value {val} must be one of: 30, 35, 40, 45, 50, 55, 60")
+
+        return total
+
+        return total
+    
+
+    #################################
+    ####### SEASONS FILTERS #########
+    #################################
+
+    seasons: Optional[SeasonFilter] = Field(
+        None,
+        description=(
+            "Filter by seasons. Can be exact seasons(s), or a range like "
+            "{'since_or_later': 'since 2012-2013'}, "
+            "{'since_or_earlier': 'since 2020-2021'}, etc."
+        )
+    )
+
+    @validator("seasons")
+    def validate_season(cls, seasons):
+        if seasons:
+            VALID_SEASONS = [f"since {year}-{year + 1}" for year in range(2006, 2026)]
+
+            # Validate exact
+            if seasons.exact:
+                exact_list = [seasons.exact] if isinstance(seasons.exact, str) else seasons.exact
+                for s in exact_list:
+                    if s not in VALID_SEASONS:
+                        raise ValueError(f"Invalid seasons in 'exact': '{s}'. Must be one of {VALID_SEASONS}.")
+                seasons.exact = exact_list
+
+            # Validate since_or_later / since_or_earlier
+            if seasons.since_or_later and seasons.since_or_later not in VALID_SEASONS:
+                raise ValueError(f"'since_or_later' value '{seasons.since_or_later}' is not valid. Must be one of {VALID_SEASONS}.")
+            if seasons.since_or_earlier and seasons.since_or_earlier not in VALID_SEASONS:
+                raise ValueError(f"'since_or_earlier' value '{seasons.since_or_earlier}' is not valid. Must be one of {VALID_SEASONS}.")
+
+        return seasons
+
+
+    ##################################
+    ######## WINS FILTERS ############
+    ##################################
+
+    wins: Optional[Union[int, List[int]]] = Field(
+        None,
+        description="Exact win count or list of win counts. Example: 20 or [5, 10, 25]."
+    )
+    min_wins: Optional[int] = Field(
+        None,
+        description="Minimum number of wins (inclusive), between 1 and 5000."
+    )
+    max_wins: Optional[int] = Field(
+        None,
+        description="Maximum number of wins (inclusive), between 1 and 5000."
+    )
+
+    # VALIDATE WINS is between 1 and 5000
+    @validator("wins", "min_wins", "max_wins", pre=True)
+    def validate_wins(cls, value):
+        def is_valid(val):
+            return isinstance(val, int) and 1 <= val <= 5000
+
+        if isinstance(value, int):
+            if not is_valid(value):
+                raise ValueError("Wins must be an integer between 1 and 5000")
+        elif isinstance(value, list):
+            for v in value:
+                if not is_valid(v):
+                    raise ValueError("Each value in wins list must be an integer between 1 and 5000")
+        elif value is not None:
+            raise ValueError("Wins must be an int or a list of ints between 1 and 5000")
+        return value
+    
+
+    ###################################
+    ######### LOSSES FILTERS ##########
+    ###################################
+
+    losses: Optional[Union[int, List[int]]] = Field(
+        None,
+        description="Exact loss count or list of loss counts. Example: 20 or [5, 10, 25]."
+    )
+    min_losses: Optional[int] = Field(
+        None,
+        description="Minimum number of losses (inclusive), between 1 and 5000."
+    )
+    max_losses: Optional[int] = Field(
+        None,
+        description="Maximum number of losses (inclusive), between 1 and 5000."
+    )
+
+    # VALIDATE LOSSES is between 1 and 5000
+    @validator("losses", "min_losses", "max_losses", pre=True)
+    def validate_losses(cls, value):
+        def is_valid(val):
+            return isinstance(val, int) and 1 <= val <= 5000
+
+        if isinstance(value, int):
+            if not is_valid(value):
+                raise ValueError("Losses must be an integer between 1 and 5000")
+        elif isinstance(value, list):
+            for v in value:
+                if not is_valid(v):
+                    raise ValueError("Each value in losses list must be an integer between 1 and 5000")
+        elif value is not None:
+            raise ValueError("Losses must be an int or a list of ints between 1 and 5000")
+        return value
+    
+
+    ################################
+    ###### PUSHES FILTERS ##########
+    ################################
+
+    pushes: Optional[Union[int, List[int]]] = Field(
+        None,
+        description="Exact push count or list of push counts. Example: 20 or [5, 10, 25]."
+    )
+    min_pushes: Optional[int] = Field(
+        None,
+        description="Minimum number of pushes (inclusive), between 1 and 5000."
+    )
+    max_pushes: Optional[int] = Field(
+        None,
+        description="Maximum number of pushes (inclusive), between 1 and 5000."
+    )
+
+    # VALIDATE PUSHES is between 1 and 5000
+    @validator("pushes", "min_pushes", "max_pushes", pre=True)
+    def validate_pushes(cls, value):
+        def is_valid(val):
+            return isinstance(val, int) and 1 <= val <= 5000
+
+        if isinstance(value, int):
+            if not is_valid(value):
+                raise ValueError("Pushes must be an integer between 1 and 5000")
+        elif isinstance(value, list):
+            for v in value:
+                if not is_valid(v):
+                    raise ValueError("Each value in pushes list must be an integer between 1 and 5000")
+        elif value is not None:
+            raise ValueError("Pushes must be an int or a list of ints between 1 and 5000")
+        return value
+    
+    ################################
+    ### TOTAL GAMES FILTERS ########
+    ################################
+
+    total_games: Optional[Union[int, List[int]]] = Field(
+        None,
+        description="Exact total games count or list of total games counts. Example: 20 or [5, 10, 25]."
+    )
+    min_total_games: Optional[int] = Field(
+        None,
+        description="Minimum number of total games (inclusive), between 1 and 10000."
+    )
+    max_total_games: Optional[int] = Field(
+        None,
+        description="Maximum number of total games (inclusive), between 1 and 10000."
+    )
+
+    # VALIDATE TOTAL GAMES is between 1 and 10000
+    @validator("total_games", "min_total_games", "max_total_games", pre=True)
+    def validate_total_games(cls, value):
+        def is_valid(val):
+            return isinstance(val, int) and 1 <= val <= 10000
+
+        if isinstance(value, int):
+            if not is_valid(value):
+                raise ValueError("Total games must be an integer between 1 and 10000")
+        elif isinstance(value, list):
+            for v in value:
+                if not is_valid(v):
+                    raise ValueError("Each value in total games list must be an integer between 1 and 10000")
+        elif value is not None:
+            raise ValueError("Total games must be an int or a list of ints between 1 and 10000")
+        return value
+    
+
+    ##################################
+    ##### WIN PERCENTAGE FILTERS #####
+    ##################################
+
+    win_percentage: Optional[Union[float, List[float]]] = Field(
+        None,
+        description="Exact win percentage or list of win percentages. Example: 75 or [50.3, 62.12, 100]."
+    )
+    min_win_percentage: Optional[float] = Field(
+        None,
+        description="Minimum win percentage (inclusive), between 0 and 100."
+    )
+    max_win_percentage: Optional[float] = Field(
+        None,
+        description="Maximum win percentage (inclusive), between 0 and 100."
+    )
+
+    # VALIDATE WIN PERCENTAGE is between 0 and 100
+    @validator("win_percentage", "min_win_percentage", "max_win_percentage", pre=True)
+    def validate_win_percentage(cls, value):
+        def is_valid(val):
+            return isinstance(val, (int, float)) and 0 <= val <= 100
+
+        if isinstance(value, (int, float)):
+            if not is_valid(value):
+                raise ValueError("Win percentage must be a number between 0 and 100")
+        elif isinstance(value, list):
+            for v in value:
+                if not is_valid(v):
+                    raise ValueError("Each value in win percentage list must be a number between 0 and 100")
+        elif value is not None:
+            raise ValueError("Win percentage must be a number or a list of numbers between 0 and 100")
+        return value
+    
+
+    ##################################
+    ### GAMES APPLICABLE FILTERS #####
+    ##################################
+    
+    games_applicable: Optional[Union["GamesApplicableFilter", str, List[str]]] = Field(
+        None,
+        description=(
+            "Filter by games applicable to the trend. Supports nested structure with games and match_mode. "
+            "Can also accept flat values for backwards compatibility. "
+            "Game format: 'HOMEABBREVvsAWAYABBREV' (e.g., 'PHIvsDAL', 'CLEvsCIN'). "
+            "Examples: {'games': 'PHIvsDAL', 'match_mode': 'contains_all'} or {'games': ['PHIvsDAL', 'CLEvsCIN']} or just 'PHIvsDAL'."
+        )
+    )
+
+    # VALIDATE GAMES APPLICABLE - handle both nested and flat formats
+    @validator("games_applicable", pre=True)
+    def validate_games_applicable(cls, value):
+        if value is None:
+            return None
+
+        # If it's already a dict (nested structure), validate it as GamesApplicableFilter
+        if isinstance(value, dict):
+            return GamesApplicableFilter(**value)
+        
+        # If it's a flat format (string or list), convert to nested structure with default match_mode
+        if isinstance(value, (str, list)):
+            return GamesApplicableFilter(games=value, match_mode="contains_all")
+        
+        # If it's already a GamesApplicableFilter instance, return as-is
+        if isinstance(value, GamesApplicableFilter):
+            return value
+        
+        raise ValueError("games_applicable must be a string, list of strings, or a nested object with games and match_mode")
+
+    ##################################
+    ####### SORTING FILTERS ##########
+    ##################################
+    sort_by: Optional[List[SortField]] = Field(
+        [
+            SortField(field="win_percentage", order="desc"),
+            SortField(field="total_games", order="desc"),
+        ],
+        description=(
+            "Sort the results by one or more fields. Can be a single field as a string or dictionary (default is ascending), or a list of fields and directions as dictionaries. "
+            "Example: 'month', ['wins', 'total_games'], {'field': 'win_percentage', 'order': 'desc'}, [{'field': 'win_percentage', 'order': 'desc'}, {'field': 'total_games', 'order': 'desc'}]."
+        )
+    )
+
+    # VALIDATE SORTING is a list of SortField objects or strings
+    @validator("sort_by", pre=True)
+    def validate_sort_by(cls, value):
+        if not value:
+            return None
+
+        if isinstance(value, str):
+            # Single field as string (defaults to asc)
+            return [SortField(field=value, order="asc")]
+        
+        if isinstance(value, dict):
+            if "field" not in value:
+                raise ValueError("Sort field must be specified in the dictionary")
+            elif "order" not in value:
+                value["order"] = "asc"
+            return [SortField(**value)]
+
+        if isinstance(value, list):
+            result = []
+            for v in value:
+                if isinstance(v, dict):
+                    # Fill in default order if not specified
+                    if "field" not in v:
+                        raise ValueError("Sort field must be specified in the dictionary")
+                    if "order" not in v:
+                        v["order"] = "asc"
+                    result.append(SortField(**v))
+                elif isinstance(v, str):
+                    result.append(SortField(field=v, order="asc"))
+                else:
+                    raise ValueError(f"Invalid item in sort_by list: {v}")
+            return result
+
+        raise ValueError(
+            "Invalid format for 'sort_by'. Expected a string (e.g. 'wins'), "
+            "a list of strings (e.g. ['month', 'season']), an object with 'field' and optional 'order' (e.g. {'field': 'wins', 'order': 'asc'}), "
+            "or a list of objects with 'field' and optional 'order' (e.g. [{'field': 'year', 'order': 'desc'}])."
+        )
+
+
+# Update forward references for the nested GamesApplicableFilter
+WeeklyTrendFilter.model_rebuild()
+
+
+@router.post("/weekly-trends", summary="Retrieve trends with filters", tags=["WeeklyTrends"])
+def get_trends(filters: WeeklyTrendFilter, db: Session = Depends(get_connection)):
+    """
+    Retrieve trends from the database based on the provided filters.
+
+    - **trend_id**: Filter by trend ID(s). The format is a comma separated list of filters for trends in the following order: category,month,day of week,divisional,spread,total,seasons since (Ex: 'home ats,October,Thursday,False,8 or less,40 or less,since 2008-2009').
+    - **category**: Filter by category. Can be a single category or a list of categories from the following options: home outright, away outright, favorite outright, underdog outright, home favorite outright, away underdog outright, away favorite outright, home underdog outright, home ats, away ats, favorite ats, underdog ats, home favorite ats, away underdog ats, away favorite ats, home underdog ats, over, under (Ex: 'home ats' or ['home outright', 'away outright']).
+    - **month**: Filter by month. Can be a single month, a list of months, or 'None' (as a string to filter for NULL values) (Ex: 'January' or ['January', 'February'] or 'None').
+    - **start_month**: Start month for filtering trends (Ex: January).
+    - **end_month**: End month for filtering trends (Ex: December).
+    - **day_of_week**: Filter by day of the week. Can be a single day, a list of days, or 'None' (as a string to filter for NULL values) (Ex: 'Monday' or ['Monday', 'Tuesday'] or 'None').
+    - **divisional**: Filter for divisional trends. Can be True, False, or 'None' (as a string to filter for NULL values) (Ex: True or False or 'None').
+    - **spread**: Filter by spread. Can be 'None' to get rows where spread is null, or a structured filter like {'exact': '3.0'} or {'or_more': 6} or {'or_less': 10} or {'or_more': [7, 8, 9]} or {'or_less': [10, 11, 12]} or {'exact': ['7.5', '1.5'], 'or_more': 12} or {'exact': ['7.0', '10.5'], 'or_less': [3, 4], 'or_more': [10, 11]}.
+    - **total**: Filter by total. Can be 'None' for null totals, or a filter like {'exact': '45 or more'} or {'or_less': 50} or {'or_more': [35, 40]} or {'or_less': [45, 50]} or {'exact': ['30 or more', '40 or less'], 'or_more': 55}, etc.
+    - **seasons**: Filter by seasons. Can be exact seasons(s), or a range like {'since_or_later': 'since 2012-2013'}, {'since_or_earlier': 'since 2020-2021'}, etc or a combination of both.
+    - **wins**: Exact win count or list of win counts (Ex: 20 or [5, 10, 25]).
+    - **min_wins**: Minimum number of wins (inclusive), between 1 and 5000 (Ex: 10).
+    - **max_wins**: Maximum number of wins (inclusive), between 1 and 5000 (Ex: 100).
+    - **losses**: Exact loss count or list of loss counts (Ex: 20 or [5, 10, 25]).
+    - **min_losses**: Minimum number of losses (inclusive), between 1 and 5000 (Ex: 10).
+    - **max_losses**: Maximum number of losses (inclusive), between 1 and 5000 (Ex: 100).
+    - **pushes**: Exact push count or list of push counts (Ex: 20 or [5, 10, 25]).
+    - **min_pushes**: Minimum number of pushes (inclusive), between 1 and 5000 (Ex: 10).
+    - **max_pushes**: Maximum number of pushes (inclusive), between 1 and 5000 (Ex: 100).
+    - **total_games**: Exact total games count or list of total games counts (Ex: 20 or [5, 10, 25]).
+    - **min_total_games**: Minimum number of total games (inclusive), between 1 and 10000 (Ex: 10).
+    - **max_total_games**: Maximum number of total games (inclusive), between 1 and 10000 (Ex: 100).
+    - **win_percentage**: Exact win percentage or list of win percentages (Ex: 75 or [50.3, 62.12, 100]).
+    - **min_win_percentage**: Minimum win percentage (inclusive), between 0 and 100 (Ex: 10).
+    - **max_win_percentage**: Maximum win percentage (inclusive), between 0 and 100 (Ex: 100).
+    - **limit**: Limit the number of results returned (Ex: 100).
+    - **offset**: Offset the results returned (Ex: 0).
+    - **games_applicable**: Filter by games applicable to the trend. Supports nested structure with games and match_mode for advanced filtering, or flat values for backwards compatibility. Game format: 'HOMEABBREVvsAWAYABBREV' (e.g., 'PHIvsDAL', 'CLEvsCIN'). Examples: {'games': 'PHIvsDAL', 'match_mode': 'contains_all'}, {'games': ['PHIvsDAL', 'CLEvsCIN'], 'match_mode': 'contains_any'}, or just 'PHIvsDAL'. Match modes: 'contains_all' (default), 'contains_any', 'exact', 'excludes_any'.
+    - **sort_by**: Sort the results by one or more fields. Can be a single field as a string or dictionary (default is ascending), or a list of fields and directions as dictionaries (Ex: 'month', ['wins', 'total_games'], {'field': 'win_percentage', 'order': 'desc'}, [{'field': 'win_percentage', 'order': 'desc'}, {'field': 'total_games', 'order': 'desc'}]).
+    """
+
+    query = db.query(WeeklyTrend)
+    filters_list = []
+
+    # Filter by TREND ID
+    if filters.trend_id:
+        if isinstance(filters.trend_id, str):
+            filters_list.append(WeeklyTrend.id_string == filters.trend_id)
+        else:
+            print(filters.trend_id)
+            filters_list.append(WeeklyTrend.id_string.in_(filters.trend_id))
+
+    # Filter by CATEGORY
+    if filters.category:
+        if isinstance(filters.category, str):
+            filters_list.append(WeeklyTrend.category == filters.category)
+        else:
+            filters_list.append(WeeklyTrend.category.in_(filters.category))
+
+    # Filter by MONTH
+    month_case = case(
+        (WeeklyTrend.month == "January", 1),
+        (WeeklyTrend.month == "February", 2),
+        (WeeklyTrend.month == "March", 3),
+        (WeeklyTrend.month == "April", 4),
+        (WeeklyTrend.month == "May", 5),
+        (WeeklyTrend.month == "June", 6),
+        (WeeklyTrend.month == "July", 7),
+        (WeeklyTrend.month == "August", 8),
+        (WeeklyTrend.month == "September", 9),
+        (WeeklyTrend.month == "October", 10),
+        (WeeklyTrend.month == "November", 11),
+        (WeeklyTrend.month == "December", 12),
+        else_=0
+    )
+
+    # Handle month value or list (including "None")
+    month_conditions = []
+    if filters.month:
+        if isinstance(filters.month, str):
+            if filters.month == "None":
+                month_conditions.append(WeeklyTrend.month == None)
+            else:
+                month_conditions.append(WeeklyTrend.month == filters.month)
+        else:  # list
+            values = [v for v in filters.month if v != "None"]
+            if values:
+                month_conditions.append(WeeklyTrend.month.in_(values))
+            if "None" in filters.month:
+                month_conditions.append(WeeklyTrend.month == None)
+
+    # Handle start_month/end_month range
+    range_condition = None
+    if filters.start_month and filters.end_month:
+        start = MONTH_MAPPING[filters.start_month]
+        end = MONTH_MAPPING[filters.end_month]
+        range_condition = and_(WeeklyTrend.month != None, month_case.between(start, end))
+    elif filters.start_month:
+        start = MONTH_MAPPING[filters.start_month]
+        range_condition = and_(WeeklyTrend.month != None, month_case >= start)
+    elif filters.end_month:
+        end = MONTH_MAPPING[filters.end_month]
+        range_condition = and_(WeeklyTrend.month != None, month_case <= end)
+
+    # Combine logic: OR between month filter and range
+    if month_conditions and range_condition is not None:
+        print("Combining month conditions with range condition")
+        filters_list.append(or_(or_(*month_conditions), range_condition))
+    elif month_conditions:
+        print("Adding month conditions")
+        filters_list.append(or_(*month_conditions))
+    elif range_condition is not None:
+        print("Adding range condition")
+        filters_list.append(range_condition)
+
+    # Filter by DAY OF WEEK
+    if filters.day_of_week:
+        if isinstance(filters.day_of_week, str):
+            if filters.day_of_week == 'None':
+                filters_list.append(WeeklyTrend.day_of_week.is_(None))
+            else:
+                filters_list.append(WeeklyTrend.day_of_week == filters.day_of_week)
+        else:
+            days = []
+            include_null = False
+            for day in filters.day_of_week:
+                if day == 'None':
+                    include_null = True
+                else:
+                    days.append(day)
+            conditions = []
+            if days:
+                conditions.append(WeeklyTrend.day_of_week.in_(days))
+            if include_null:
+                conditions.append(WeeklyTrend.day_of_week.is_(None))
+            filters_list.append(or_(*conditions))
+
+    # Filter by DIVISIONAL
+    if filters.divisional == "None":
+        filters_list.append(WeeklyTrend.divisional.is_(None))
+    elif filters.divisional in (True, False):
+        filters_list.append(WeeklyTrend.divisional == filters.divisional)
+
+    # Filter by SPREAD
+    if filters.spread:
+        spread_clauses = []
+
+        if isinstance(filters.spread, str):
+            if filters.spread == "None":
+                spread_clauses.append(WeeklyTrend.spread.is_(None))
+
+        elif isinstance(filters.spread, SpreadFilter):
+            if filters.spread.exact:
+                exact_list = [filters.spread.exact] if isinstance(filters.spread.exact, str) else filters.spread.exact
+                non_null_spreads = [s for s in exact_list if s != "None"]
+                if non_null_spreads:
+                    spread_clauses.append(WeeklyTrend.spread.in_(non_null_spreads))
+                if "None" in exact_list:
+                    spread_clauses.append(WeeklyTrend.spread.is_(None))
+
+            if filters.spread.or_less is not None:
+                or_less_list = [filters.spread.or_less] if isinstance(filters.spread.or_less, int) else filters.spread.or_less
+                or_less_values = [f"{val} or less" for val in or_less_list]
+                spread_clauses.append(WeeklyTrend.spread.in_(or_less_values))
+
+            if filters.spread.or_more is not None:
+                or_more_list = [filters.spread.or_more] if isinstance(filters.spread.or_more, int) else filters.spread.or_more
+                or_more_values = [f"{val} or more" for val in or_more_list]
+                spread_clauses.append(WeeklyTrend.spread.in_(or_more_values))
+
+        if spread_clauses:
+            filters_list.append(or_(*spread_clauses))
+
+    # Filter by TOTAL
+    if filters.total:
+        total_clauses = []
+
+        if isinstance(filters.total, str):
+            if filters.total == "None":
+                total_clauses.append(WeeklyTrend.total.is_(None))
+
+        elif isinstance(filters.total, TotalFilter):
+            if filters.total.exact:
+                exact_list = [filters.total.exact] if isinstance(filters.total.exact, str) else filters.total.exact
+                non_null_totals = [t for t in exact_list if t != "None"]
+                if non_null_totals:
+                    total_clauses.append(WeeklyTrend.total.in_(non_null_totals))
+                if "None" in exact_list:
+                    total_clauses.append(WeeklyTrend.total.is_(None))
+
+            if filters.total.or_less is not None:
+                or_less_list = [filters.total.or_less] if isinstance(filters.total.or_less, int) else filters.total.or_less
+                or_less_values = [f"{val} or less" for val in or_less_list]
+                total_clauses.append(WeeklyTrend.total.in_(or_less_values))
+
+            if filters.total.or_more is not None:
+                or_more_list = [filters.total.or_more] if isinstance(filters.total.or_more, int) else filters.total.or_more
+                or_more_values = [f"{val} or more" for val in or_more_list]
+                total_clauses.append(WeeklyTrend.total.in_(or_more_values))
+
+        if total_clauses:
+            filters_list.append(or_(*total_clauses))
+
+    # Filter by SEASONS
+    if filters.seasons:
+        season_clauses = []
+        VALID_SEASONS = [f"since {year}-{year + 1}" for year in range(2006, 2026)]
+
+        if filters.seasons.exact:
+            season_clauses.append(WeeklyTrend.seasons.in_(filters.seasons.exact))
+
+        if filters.seasons.since_or_later:
+            index = VALID_SEASONS.index(filters.seasons.since_or_later)
+            season_clauses.append(WeeklyTrend.seasons.in_(VALID_SEASONS[index:]))
+
+        if filters.seasons.since_or_earlier:
+            index = VALID_SEASONS.index(filters.seasons.since_or_earlier)
+            season_clauses.append(WeeklyTrend.seasons.in_(VALID_SEASONS[: index + 1]))
+
+        if season_clauses:
+            filters_list.append(or_(*season_clauses))
+
+    # Filter by WINS
+    if filters.wins:
+        if isinstance(filters.wins, int):
+            filters_list.append(WeeklyTrend.wins == filters.wins)
+        else:
+            filters_list.append(WeeklyTrend.wins.in_(filters.wins))
+
+    if filters.min_wins is not None and filters.max_wins is not None:
+        filters_list.append(WeeklyTrend.wins.between(filters.min_wins, filters.max_wins))
+    elif filters.min_wins is not None:
+        filters_list.append(WeeklyTrend.wins >= filters.min_wins)
+    elif filters.max_wins is not None:
+        filters_list.append(WeeklyTrend.wins <= filters.max_wins)
+
+    # Filter by LOSSES
+    if filters.losses:
+        if isinstance(filters.losses, int):
+            filters_list.append(WeeklyTrend.losses == filters.losses)
+        else:
+            filters_list.append(WeeklyTrend.losses.in_(filters.losses))
+
+    if filters.min_losses is not None and filters.max_losses is not None:
+        filters_list.append(WeeklyTrend.losses.between(filters.min_losses, filters.max_losses))
+    elif filters.min_losses is not None:
+        filters_list.append(WeeklyTrend.losses >= filters.min_losses)
+    elif filters.max_losses is not None:
+        filters_list.append(WeeklyTrend.losses <= filters.max_losses)
+
+    # Filter by PUSHES
+    if filters.pushes:
+        if isinstance(filters.pushes, int):
+            filters_list.append(WeeklyTrend.pushes == filters.pushes)
+        else:
+            filters_list.append(WeeklyTrend.pushes.in_(filters.pushes))
+
+    if filters.min_pushes is not None and filters.max_pushes is not None:
+        filters_list.append(WeeklyTrend.pushes.between(filters.min_pushes, filters.max_pushes))
+    elif filters.min_pushes is not None:
+        filters_list.append(WeeklyTrend.pushes >= filters.min_pushes)
+    elif filters.max_pushes is not None:
+        filters_list.append(WeeklyTrend.pushes <= filters.max_pushes)
+
+    # Filter by TOTAL GAMES
+    if filters.total_games:
+        if isinstance(filters.total_games, int):
+            filters_list.append(WeeklyTrend.total_games == filters.total_games)
+        else:
+            filters_list.append(WeeklyTrend.total_games.in_(filters.total_games))
+
+    if filters.min_total_games is not None and filters.max_total_games is not None:
+        filters_list.append(WeeklyTrend.total_games.between(filters.min_total_games, filters.max_total_games))
+    elif filters.min_total_games is not None:
+        filters_list.append(WeeklyTrend.total_games >= filters.min_total_games)
+    elif filters.max_total_games is not None:
+        filters_list.append(WeeklyTrend.total_games <= filters.max_total_games)
+
+    # Filter by WIN PERCENTAGE
+    if filters.win_percentage:
+        if isinstance(filters.win_percentage, float):
+            filters_list.append(WeeklyTrend.win_percentage == filters.win_percentage)
+        else:
+            filters_list.append(WeeklyTrend.win_percentage.in_(filters.win_percentage))
+
+    if filters.min_win_percentage is not None and filters.max_win_percentage is not None:
+        filters_list.append(WeeklyTrend.win_percentage.between(filters.min_win_percentage, filters.max_win_percentage))
+    elif filters.min_win_percentage is not None:
+        filters_list.append(WeeklyTrend.win_percentage >= filters.min_win_percentage)
+    elif filters.max_win_percentage is not None:
+        filters_list.append(WeeklyTrend.win_percentage <= filters.max_win_percentage)
+
+    # Filter by GAMES APPLICABLE
+    if filters.games_applicable:
+        games_filter = filters.games_applicable
+        games_to_search = games_filter.games
+        match_mode = games_filter.match_mode
+        
+        if match_mode == "exact":
+            # Exact match of the entire games_applicable string
+            if len(games_to_search) == 1:
+                filters_list.append(WeeklyTrend.games_applicable == games_to_search[0])
+            else:
+                # For multiple games, we need to check for exact match of the entire list
+                # The games_applicable field stores comma-separated games like "PHIvsDAL, CLEvsCIN"
+                # We need to match all possible orderings since "PHIvsDAL, CLEvsCIN" == "CLEvsCIN, PHIvsDAL"
+                exact_conditions = []
+                # Generate all possible orderings of the games
+                for perm in permutations(games_to_search):
+                    exact_string = ", ".join(perm)
+                    exact_conditions.append(WeeklyTrend.games_applicable == exact_string)
+                
+                filters_list.append(or_(*exact_conditions))
+                
+        elif match_mode == "contains_any":
+            # Match if ANY of the specified games are in the games_applicable list
+            any_conditions = []
+            for game in games_to_search:
+                # Use LIKE to find the game in the comma-separated list
+                any_conditions.append(WeeklyTrend.games_applicable.like(f"%{game}%"))
+            filters_list.append(or_(*any_conditions))
+            
+        elif match_mode == "contains_all":
+            # Match if ALL of the specified games are in the games_applicable list
+            all_conditions = []
+            for game in games_to_search:
+                all_conditions.append(WeeklyTrend.games_applicable.like(f"%{game}%"))
+            filters_list.append(and_(*all_conditions))
+            
+        elif match_mode == "excludes_any":
+            # Match trends that do NOT contain ANY of the specified games
+            exclude_conditions = []
+            for game in games_to_search:
+                # Use NOT LIKE to exclude games that contain this game
+                exclude_conditions.append(~WeeklyTrend.games_applicable.like(f"%{game}%"))
+            # All games must be excluded (AND condition)
+            filters_list.append(and_(*exclude_conditions))
+
+    # Apply filters to the query
+    if filters_list:
+        query = query.filter(*filters_list)
+
+    total_count = query.order_by(None).count()
+
+    # Sorting
+    valid_sort_fields = {c_attr.key for c_attr in inspect(WeeklyTrend).mapper.column_attrs}
+    if filters.sort_by:
+        sort_columns = []
+        for sort in filters.sort_by:
+            if sort.field not in valid_sort_fields:
+                raise HTTPException(status_code=400, detail=f"Invalid sort field: {sort.field}")
+
+            if sort.field == "month":
+                month_case = case(
+                    (WeeklyTrend.month == "January", 1),
+                    (WeeklyTrend.month == "February", 2),
+                    (WeeklyTrend.month == "March", 3),
+                    (WeeklyTrend.month == "April", 4),
+                    (WeeklyTrend.month == "May", 5),
+                    (WeeklyTrend.month == "June", 6),
+                    (WeeklyTrend.month == "July", 7),
+                    (WeeklyTrend.month == "August", 8),
+                    (WeeklyTrend.month == "September", 9),
+                    (WeeklyTrend.month == "October", 10),
+                    (WeeklyTrend.month == "November", 11),
+                    (WeeklyTrend.month == "December", 12),
+                    (WeeklyTrend.month == None, 13),
+                    else_=14
+                )
+                sort_columns.append(month_case.desc() if sort.order == "desc" else month_case.asc())
+            elif sort.field == 'day_of_week':
+                day_case = case(
+                    (WeeklyTrend.day_of_week == "Sunday", 1),
+                    (WeeklyTrend.day_of_week == "Monday", 2),
+                    (WeeklyTrend.day_of_week == "Tuesday", 3),
+                    (WeeklyTrend.day_of_week == "Wednesday", 4),
+                    (WeeklyTrend.day_of_week == "Thursday", 5),
+                    (WeeklyTrend.day_of_week == "Friday", 6),
+                    (WeeklyTrend.day_of_week == "Saturday", 7),
+                    (WeeklyTrend.day_of_week == None, 8),
+                    else_=9
+                )
+                sort_columns.append(day_case.desc() if sort.order == "desc" else day_case.asc())
+            else:
+                col = getattr(WeeklyTrend, sort.field)
+                sort_columns.append(col.desc() if sort.order == "desc" else col.asc())
+
+        if sort_columns:
+            query = query.order_by(*sort_columns)
+
+    # Pagination
+    if filters.limit:
+        query = query.limit(filters.limit)
+    if filters.offset:
+        query = query.offset(filters.offset)
+
+    trends = query.all()
+
+    if not trends:
+        return []
+    return {
+        "limit": filters.limit,
+        "offset": filters.offset,
+        "count": len(trends),
+        "total_count": total_count,
+        "results": trends,
+    }
+
+
+@router.get("/weekly-filter-options", summary="Get available filter options for weekly trends", tags=["WeeklyTrends"])
+def get_weekly_filter_options(db: Session = Depends(get_connection)):
+    """
+    Get available filter options for weekly trends based on current week's data.
+    Returns the distinct values available in the weekly trends table.
+    Uses caching to improve performance.
+    """
+    # Check if we have cached data that's still valid
+    current_time = time.time()
+    if (_weekly_options_cache["data"] is not None and 
+        current_time - _weekly_options_cache["timestamp"] < _weekly_options_cache["ttl"]):
+        return _weekly_options_cache["data"]
+    
+    try:
+        # Query the database directly for distinct values
+        months = [row[0] for row in db.query(func.distinct(WeeklyTrend.month)).all() if row[0] is not None]
+        day_of_weeks = [row[0] for row in db.query(func.distinct(WeeklyTrend.day_of_week)).all() if row[0] is not None]
+        divisionals = [row[0] for row in db.query(func.distinct(WeeklyTrend.divisional)).all() if row[0] is not None]
+        spreads = [row[0] for row in db.query(func.distinct(WeeklyTrend.spread)).all() if row[0] is not None]
+        totals = [row[0] for row in db.query(func.distinct(WeeklyTrend.total)).all() if row[0] is not None]
+        
+        # Sort the results appropriately
+        months_sorted = sorted(months, key=lambda x: ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].index(x) if x in ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'] else 999) if months else []
+        
+        day_of_weeks_sorted = sorted(day_of_weeks, key=lambda x: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].index(x) if x in ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] else 999) if day_of_weeks else []
+        
+        divisionals_sorted = sorted(divisionals) if divisionals else []
+        
+        # Sort spreads: exact values first, then "or more" values, then "or less" values
+        spreads_sorted = []
+        if spreads:
+            exact_spreads = [s for s in spreads if 'or more' not in s and 'or less' not in s]
+            or_more_spreads = [s for s in spreads if 'or more' in s]
+            or_less_spreads = [s for s in spreads if 'or less' in s]
+            
+            # Sort exact spreads numerically
+            try:
+                exact_spreads_sorted = sorted(exact_spreads, key=lambda x: float(x) if x.replace('.', '').isdigit() else 999)
+            except:
+                exact_spreads_sorted = sorted(exact_spreads)
+            
+            # Sort "or more" and "or less" by their numeric values
+            try:
+                or_more_sorted = sorted(or_more_spreads, key=lambda x: float(x.replace(' or more', '')) if x.replace(' or more', '').replace('.', '').isdigit() else 999)
+                or_less_sorted = sorted(or_less_spreads, key=lambda x: float(x.replace(' or less', '')) if x.replace(' or less', '').replace('.', '').isdigit() else 999)
+            except:
+                or_more_sorted = sorted(or_more_spreads)
+                or_less_sorted = sorted(or_less_spreads)
+            
+            spreads_sorted = exact_spreads_sorted + or_more_sorted + or_less_sorted
+        
+        # Sort totals: "or more" values first, then "or less" values
+        totals_sorted = []
+        if totals:
+            or_more_totals = [s for s in totals if 'or more' in s]
+            or_less_totals = [s for s in totals if 'or less' in s]
+            
+            try:
+                or_more_sorted = sorted(or_more_totals, key=lambda x: int(x.replace(' or more', '')) if x.replace(' or more', '').isdigit() else 999)
+                or_less_sorted = sorted(or_less_totals, key=lambda x: int(x.replace(' or less', '')) if x.replace(' or less', '').isdigit() else 999)
+            except:
+                or_more_sorted = sorted(or_more_totals)
+                or_less_sorted = sorted(or_less_totals)
+            
+            totals_sorted = or_more_sorted + or_less_sorted
+        
+        result = {
+            "months": months_sorted,
+            "day_of_weeks": day_of_weeks_sorted,
+            "divisionals": divisionals_sorted,
+            "spreads": spreads_sorted,
+            "totals": totals_sorted
+        }
+        
+        # Cache the result
+        _weekly_options_cache["data"] = result
+        _weekly_options_cache["timestamp"] = current_time
+        
+        return result
+        
+    except Exception as e:
+        # Return empty lists if there's any error
+        return {
+            "months": [],
+            "day_of_weeks": [],
+            "divisionals": [],
+            "spreads": [],
+            "totals": []
+        }

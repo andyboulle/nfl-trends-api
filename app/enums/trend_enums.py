@@ -1,0 +1,45 @@
+from enum import Enum
+
+class CategoryEnum(str, Enum):
+    HOME_OUTRIGHT = "home outright"
+    AWAY_OUTRIGHT = "away outright"
+    FAVORITE_OUTRIGHT = "favorite outright"
+    UNDERDOG_OUTRIGHT = "underdog outright"
+    HOME_FAVORITE_OUTRIGHT = "home favorite outright"
+    AWAY_UNDERDOG_OUTRIGHT = "away underdog outright"
+    AWAY_FAVORITE_OUTRIGHT = "away favorite outright"
+    HOME_UNDERDOG_OUTRIGHT = "home underdog outright"
+    HOME_ATS = "home ats"
+    AWAY_ATS = "away ats"
+    FAVORITE_ATS = "favorite ats"
+    UNDERDOG_ATS = "underdog ats"
+    HOME_FAVORITE_ATS = "home favorite ats"
+    AWAY_UNDERDOG_ATS = "away underdog ats"
+    AWAY_FAVORITE_ATS = "away favorite ats"
+    HOME_UNDERDOG_ATS = "home underdog ats"
+    OVER = "over"
+    UNDER = "under"
+
+class MonthEnum(str, Enum):
+    JANUARY = "January"
+    FEBRUARY = "February"
+    MARCH = "March"
+    APRIL = "April"
+    MAY = "May"
+    JUNE = "June"
+    JULY = "July"
+    AUGUST = "August"
+    SEPTEMBER = "September"
+    OCTOBER = "October"
+    NOVEMBER = "November"
+    DECEMBER = "December"
+
+class DayOfWeekEnum(str, Enum):
+    SUNDAY = "Sunday"
+    MONDAY = "Monday"
+    TUESDAY = "Tuesday"
+    WEDNESDAY = "Wednesday"
+    THURSDAY = "Thursday"
+    FRIDAY = "Friday"
+    SATURDAY = "Saturday"
+
