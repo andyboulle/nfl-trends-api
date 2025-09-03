@@ -23,15 +23,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-api_v1 = FastAPI()
-
-api_v1.include_router(games.router)
-api_v1.include_router(trends.router)
-api_v1.include_router(upcoming_games.router)
-api_v1.include_router(weekly_trends.router)
-api_v1.include_router(game_trends.router, prefix="/trends")
-
-app.mount("/api/v1", api_v1)
+app.include_router(games.router, prefix='/api/v1')
+app.include_router(trends.router, prefix='/api/v1')
+app.include_router(upcoming_games.router, prefix='/api/v1')
+app.include_router(weekly_trends.router, prefix='/api/v1')
+app.include_router(game_trends.router, prefix="/api/v1/trends")
 
 @app.get('/')
 def read_root():
