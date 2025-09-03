@@ -13,7 +13,7 @@ Information about the endpoints and models used can be found in the `docs/` fold
 
 1. Clone the repository
     ```bash
-    git clone <repo link>
+    git clone https://github.com/andyboulle/nfl-trends-api.git
     ```
 
 2. Navigate to the directory
