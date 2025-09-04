@@ -12,8 +12,10 @@ from app.cache import (
     get_cache_stats,
     clear_upcoming_games_cache,
     clear_weekly_trends_cache,
+    clear_weekly_filter_options_cache,
     get_upcoming_games_from_cache,
-    get_initial_weekly_trends_from_cache
+    get_initial_weekly_trends_from_cache,
+    get_weekly_filter_options_from_cache
 )
 
 router = APIRouter()
@@ -91,7 +93,7 @@ def clear_all_caches_endpoint(preserve_protected: bool = True) -> Dict[str, str]
     Clear all caches.
     
     Args:
-        preserve_protected: If True (default), preserves protected entries (upcoming games default and initial weekly trends)
+        preserve_protected: If True (default), preserves protected entries (upcoming games default, initial weekly trends, and weekly filter options)
         
     Returns:
         Success message
@@ -99,6 +101,10 @@ def clear_all_caches_endpoint(preserve_protected: bool = True) -> Dict[str, str]
     try:
         clear_upcoming_games_cache(preserve_default=preserve_protected)
         clear_weekly_trends_cache(preserve_initial=preserve_protected)
+        
+        # Only clear weekly filter options if preserve_protected is False
+        if not preserve_protected:
+            clear_weekly_filter_options_cache()
         
         message = "All caches cleared"
         if preserve_protected:
@@ -109,6 +115,21 @@ def clear_all_caches_endpoint(preserve_protected: bool = True) -> Dict[str, str]
         return {"message": message}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error clearing all caches: {str(e)}")
+
+
+@router.post("/cache/clear/weekly-filter-options", summary="Clear weekly filter options cache", tags=["Cache Management"])
+def clear_weekly_filter_options_cache_endpoint() -> Dict[str, str]:
+    """
+    Clear the weekly filter options cache.
+    
+    Returns:
+        Success message
+    """
+    try:
+        clear_weekly_filter_options_cache()
+        return {"message": "Weekly filter options cache cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error clearing weekly filter options cache: {str(e)}")
 
 
 @router.get("/cache/protected-entries", summary="Check protected cache entries", tags=["Cache Management"])
@@ -122,6 +143,7 @@ def get_protected_entries() -> Dict[str, Any]:
     try:
         upcoming_games_cached = get_upcoming_games_from_cache()
         initial_trends_cached = get_initial_weekly_trends_from_cache()
+        weekly_filter_options_cached = get_weekly_filter_options_from_cache()
         
         return {
             "upcoming_games_default": {
@@ -131,6 +153,12 @@ def get_protected_entries() -> Dict[str, Any]:
             "initial_weekly_trends": {
                 "exists": initial_trends_cached is not None,
                 "trend_count": initial_trends_cached.get("count", 0) if initial_trends_cached else 0
+            },
+            "weekly_filter_options": {
+                "exists": weekly_filter_options_cached is not None,
+                "month_count": len(weekly_filter_options_cached.get("months", [])) if weekly_filter_options_cached else 0,
+                "spread_count": len(weekly_filter_options_cached.get("spreads", [])) if weekly_filter_options_cached else 0,
+                "total_count": len(weekly_filter_options_cached.get("totals", [])) if weekly_filter_options_cached else 0
             }
         }
     except Exception as e:

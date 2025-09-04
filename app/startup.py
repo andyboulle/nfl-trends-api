@@ -7,12 +7,13 @@ including pre-populating caches with initial data.
 
 from sqlalchemy.orm import Session
 from app.database.connection import get_connection
-from app.routers.weekly_trends import WeeklyTrendFilter, get_trends
+from app.routers.weekly_trends import WeeklyTrendFilter, get_trends, get_weekly_filter_options
 from app.routers.upcoming_games import get_upcoming_games
 from app.cache import (
     generate_cache_key,
     set_weekly_trends_cache,
     set_upcoming_games_cache,
+    set_weekly_filter_options_cache,
     extract_games_from_upcoming_games
 )
 
@@ -23,8 +24,9 @@ async def startup_cache_initialization():
     
     This function:
     1. Fetches upcoming games and caches the result
-    2. Creates the initial weekly trends query with dynamic games_applicable
-    3. Caches the initial weekly trends query result
+    2. Fetches weekly filter options and caches the result
+    3. Creates the initial weekly trends query with dynamic games_applicable
+    4. Caches the initial weekly trends query result
     """
     try:
         # Get database session
@@ -33,6 +35,10 @@ async def startup_cache_initialization():
         # Cache upcoming games first
         upcoming_games_result = await get_upcoming_games(db_session)
         set_upcoming_games_cache(upcoming_games_result)
+        
+        # Cache weekly filter options
+        weekly_filter_options_result = get_weekly_filter_options(db_session)
+        set_weekly_filter_options_cache(weekly_filter_options_result)
         
         # Extract game strings for weekly trends query
         current_games = extract_games_from_upcoming_games(upcoming_games_result)
@@ -129,6 +135,7 @@ async def startup_cache_initialization():
         
         print("✅ Cache initialization completed successfully")
         print(f"✅ Cached upcoming games: {len(upcoming_games_result.get('upcoming_games', []))} games")
+        print(f"✅ Cached weekly filter options: {len(weekly_filter_options_result.get('months', []))} months, {len(weekly_filter_options_result.get('spreads', []))} spreads, {len(weekly_filter_options_result.get('totals', []))} totals")
         print(f"✅ Cached initial weekly trends: {len(initial_result)} trends")
         print(f"✅ Initial weekly trends cache key: {cache_key}")
         

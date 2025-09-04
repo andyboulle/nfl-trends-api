@@ -1,4 +1,3 @@
-import time
 from sqlalchemy.sql import func
 from itertools import permutations
 from sqlalchemy.orm import Session
@@ -13,17 +12,12 @@ from app.enums.trend_enums import CategoryEnum, MonthEnum, DayOfWeekEnum
 from app.cache import (
     generate_cache_key,
     get_weekly_trends_from_cache,
-    set_weekly_trends_cache
+    set_weekly_trends_cache,
+    get_weekly_filter_options_from_cache,
+    set_weekly_filter_options_cache
 )
 
 router = APIRouter()
-
-# Cache for weekly filter options to avoid frequent DB queries
-_weekly_options_cache = {
-    "data": None,
-    "timestamp": 0,
-    "ttl": 300  # 5 minutes TTL
-}
 
 MONTH_MAPPING = {
     "January": 1,
@@ -1229,11 +1223,13 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
     Returns the distinct values available in the weekly trends table.
     Uses caching to improve performance.
     """
-    # Check if we have cached data that's still valid
-    current_time = time.time()
-    if (_weekly_options_cache["data"] is not None and 
-        current_time - _weekly_options_cache["timestamp"] < _weekly_options_cache["ttl"]):
-        return _weekly_options_cache["data"]
+    # Check cache first
+    cached_result = get_weekly_filter_options_from_cache()
+    if cached_result is not None:
+        print("🎯 CACHE HIT - Weekly filter options cache hit")
+        return cached_result
+    
+    print("🔄 CACHE MISS - Fetching weekly filter options from database")
     
     try:
         # Query the database directly for distinct values
@@ -1296,14 +1292,15 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
             "totals": totals_sorted
         }
         
-        # Cache the result
-        _weekly_options_cache["data"] = result
-        _weekly_options_cache["timestamp"] = current_time
+        # Cache the result using the integrated cache system
+        set_weekly_filter_options_cache(result)
+        print(f"✅ CACHE SET - Weekly filter options cached with {len(result.get('months', []))} months, {len(result.get('spreads', []))} spreads")
         
         return result
         
     except Exception as e:
-        # Return empty lists if there's any error
+        print(f"❌ ERROR - Failed to fetch weekly filter options: {str(e)}")
+        # Return empty lists if there's any error but don't cache the error result
         return {
             "months": [],
             "day_of_weeks": [],

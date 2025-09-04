@@ -16,10 +16,12 @@ from datetime import datetime
 # Cache instances
 upcoming_games_cache = TTLCache(maxsize=16, ttl=3600)  # 1 hour TTL, max 16 entries
 weekly_trends_cache = LRUCache(maxsize=100)  # LRU cache for 100 entries
+weekly_filter_options_cache = TTLCache(maxsize=1, ttl=3600)  # 1 hour TTL, single entry
 
 # Special keys for protected cache entries
 UPCOMING_GAMES_KEY = "upcoming_games_empty_body"
 INITIAL_WEEKLY_TRENDS_KEY = "0d0aeea50e84aae522b2f54ed54f14cd9f9b651b6cb50dd6aa873441282851e9"
+WEEKLY_FILTER_OPTIONS_KEY = "weekly_filter_options"
 
 
 def generate_cache_key(data: Any) -> str:
@@ -102,6 +104,29 @@ def get_initial_weekly_trends_from_cache() -> Optional[Dict]:
     return weekly_trends_cache.get(INITIAL_WEEKLY_TRENDS_KEY)
 
 
+def get_weekly_filter_options_from_cache() -> Optional[Dict]:
+    """
+    Get weekly filter options from cache.
+    
+    Returns:
+        Cached weekly filter options data or None if not found
+    """
+    result = weekly_filter_options_cache.get(WEEKLY_FILTER_OPTIONS_KEY)
+    print(f"🔍 CACHE CHECK - Weekly filter options cache lookup: {'HIT' if result is not None else 'MISS'}")
+    return result
+
+
+def set_weekly_filter_options_cache(data: Dict) -> None:
+    """
+    Set weekly filter options in cache.
+    
+    Args:
+        data: The weekly filter options data to cache
+    """
+    weekly_filter_options_cache[WEEKLY_FILTER_OPTIONS_KEY] = data
+    print(f"💾 CACHE STORE - Weekly filter options stored in cache (size: {len(weekly_filter_options_cache)})")
+
+
 def clear_upcoming_games_cache(preserve_default: bool = True) -> None:
     """
     Clear upcoming games cache.
@@ -132,9 +157,17 @@ def clear_weekly_trends_cache(preserve_initial: bool = True) -> None:
         weekly_trends_cache.clear()
 
 
+def clear_weekly_filter_options_cache() -> None:
+    """
+    Clear weekly filter options cache.
+    """
+    weekly_filter_options_cache.clear()
+    print(f"🗑️ CACHE CLEAR - Weekly filter options cache cleared (size: {len(weekly_filter_options_cache)})")
+
+
 def get_cache_stats() -> Dict[str, Any]:
     """
-    Get statistics about both caches.
+    Get statistics about all caches.
     
     Returns:
         Dictionary containing cache statistics
@@ -153,9 +186,17 @@ def get_cache_stats() -> Dict[str, Any]:
             "current_size": len(weekly_trends_cache),
             "keys": list(weekly_trends_cache.keys())
         },
+        "weekly_filter_options_cache": {
+            "type": "TTLCache",
+            "maxsize": weekly_filter_options_cache.maxsize,
+            "current_size": len(weekly_filter_options_cache),
+            "ttl_seconds": weekly_filter_options_cache.ttl,
+            "keys": list(weekly_filter_options_cache.keys())
+        },
         "protected_keys": {
             "upcoming_games_default": UPCOMING_GAMES_KEY,
-            "initial_weekly_trends": INITIAL_WEEKLY_TRENDS_KEY
+            "initial_weekly_trends": INITIAL_WEEKLY_TRENDS_KEY,
+            "weekly_filter_options": WEEKLY_FILTER_OPTIONS_KEY
         },
         "timestamp": datetime.now().isoformat()
     }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The NFL Trends API implements a comprehensive caching system using `cachetools` to improve performance and reduce database load. The system includes two main caches with different strategies and protected entries that ensure critical data is always available.
+The NFL Trends API implements a comprehensive caching system using `cachetools` to improve performance and reduce database load. The system includes three main caches with different strategies and protected entries that ensure critical data is always available.
 
 ## Cache Types
 
@@ -19,9 +19,16 @@ The NFL Trends API implements a comprehensive caching system using `cachetools` 
 - **Purpose**: Caches complex weekly trends query results
 - **Key Generation**: SHA256 hash of filter parameters
 
+### 3. Weekly Filter Options Cache (TTL Cache)
+- **Type**: TTL (Time To Live) Cache
+- **Max Size**: 1 entry
+- **TTL**: 1 hour (3600 seconds)
+- **Purpose**: Caches weekly filter options endpoint responses
+- **Key**: `"weekly_filter_options"`
+
 ## Protected Cache Entries
 
-The system maintains two protected cache entries that are preserved during cache clearing operations:
+The system maintains three protected cache entries that are preserved during cache clearing operations:
 
 ### 1. Default Upcoming Games
 - **Key**: `"upcoming_games_empty_body"`
@@ -33,6 +40,11 @@ The system maintains two protected cache entries that are preserved during cache
 - **Content**: Comprehensive weekly trends query result with all major filter combinations
 - **Protection**: Always preserved during cache clearing operations
 - **Dynamic Content**: Games applicable section is dynamically populated from current upcoming games
+
+### 3. Weekly Filter Options
+- **Key**: `"weekly_filter_options"`
+- **Content**: Available filter options for weekly trends (months, days, spreads, totals, etc.)
+- **Protection**: Protected - preserved during cache clearing unless explicitly disabled
 
 ## Cache Key Generation
 
@@ -54,15 +66,16 @@ This ensures:
 On API startup, the system automatically:
 
 1. **Fetches and caches upcoming games** with the protected key
-2. **Extracts current game strings** from upcoming games
-3. **Creates comprehensive initial weekly trends query** with:
+2. **Fetches and caches weekly filter options** for immediate availability
+3. **Extracts current game strings** from upcoming games
+4. **Creates comprehensive initial weekly trends query** with:
    - All major categories (home/away, ats/outright, favorite/underdog, over/under)
    - Current month filters (September, None)
    - Day of week filters (Sunday, Monday, Thursday, Friday, None)
    - Spread and total ranges
    - All available seasons since 2006-2007
    - Dynamic games_applicable section using current games
-4. **Executes and caches the initial query** using the generated hash key
+5. **Executes and caches the initial query** using the generated hash key
 
 ## Cache Management Endpoints
 
@@ -84,17 +97,23 @@ POST /api/v1/cache/clear/weekly-trends?preserve_initial=true
 ```
 Clears the weekly trends cache with option to preserve the initial query.
 
+### Clear Weekly Filter Options Cache
+```
+POST /api/v1/cache/clear/weekly-filter-options
+```
+Clears the weekly filter options cache to force refresh from database.
+
 ### Clear All Caches
 ```
 POST /api/v1/cache/clear/all?preserve_protected=true
 ```
-Clears both caches with option to preserve protected entries.
+Clears all caches with option to preserve protected entries. When `preserve_protected=true` (default), upcoming games, initial weekly trends, and weekly filter options are preserved.
 
 ### Check Protected Entries
 ```
 GET /api/v1/cache/protected-entries
 ```
-Returns information about whether protected cache entries exist and their basic statistics.
+Returns information about whether protected cache entries exist and their basic statistics, including weekly filter options cache status.
 
 ## Cache Hit Logging
 
@@ -103,6 +122,7 @@ The system includes debug logging for cache operations:
 - **Cache Hits**: `🎯 CACHE HIT - [cache_type] cache hit for key: [key_prefix]...`
 - **Upcoming Games**: `🎯 CACHE HIT - Upcoming games cache hit`
 - **Weekly Trends**: `🎯 CACHE HIT - Weekly trends cache hit for key: 0d0aeea5...`
+- **Weekly Filter Options**: `🎯 CACHE HIT - Weekly filter options cache hit`
 
 ## Performance Benefits
 
@@ -110,6 +130,11 @@ The system includes debug logging for cache operations:
 - **Before**: Database query on every request
 - **After**: Cached response for 1 hour, database query only when cache expires
 - **Impact**: Significant reduction in database load for frequent upcoming games requests
+
+### Weekly Filter Options Cache
+- **Before**: Database query with multiple DISTINCT operations on every request
+- **After**: Cached response for 1 hour, database query only when cache expires
+- **Impact**: Dramatic improvement in initial page load performance
 
 ### Weekly Trends Cache
 - **Before**: Complex database queries with multiple joins and filters on every request
