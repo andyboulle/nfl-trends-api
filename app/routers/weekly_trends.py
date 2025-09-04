@@ -10,6 +10,11 @@ from fastapi import APIRouter, HTTPException, Depends
 from app.models.weekly_trend import WeeklyTrend
 from app.database.connection import get_connection
 from app.enums.trend_enums import CategoryEnum, MonthEnum, DayOfWeekEnum
+from app.cache import (
+    generate_cache_key,
+    get_weekly_trends_from_cache,
+    set_weekly_trends_cache
+)
 
 router = APIRouter()
 
@@ -801,6 +806,7 @@ WeeklyTrendFilter.model_rebuild()
 def get_trends(filters: WeeklyTrendFilter, db: Session = Depends(get_connection)):
     """
     Retrieve trends from the database based on the provided filters.
+    Uses LRU cache to improve performance for repeated queries.
 
     - **trend_id**: Filter by trend ID(s). The format is a comma separated list of filters for trends in the following order: category,month,day of week,divisional,spread,total,seasons since (Ex: 'home ats,October,Thursday,False,8 or less,40 or less,since 2008-2009').
     - **category**: Filter by category. Can be a single category or a list of categories from the following options: home outright, away outright, favorite outright, underdog outright, home favorite outright, away underdog outright, away favorite outright, home underdog outright, home ats, away ats, favorite ats, underdog ats, home favorite ats, away underdog ats, away favorite ats, home underdog ats, over, under (Ex: 'home ats' or ['home outright', 'away outright']).
@@ -832,6 +838,15 @@ def get_trends(filters: WeeklyTrendFilter, db: Session = Depends(get_connection)
     - **games_applicable**: Filter by games applicable to the trend. Supports nested structure with games and match_mode for advanced filtering, or flat values for backwards compatibility. Game format: 'HOMEABBREVvsAWAYABBREV' (e.g., 'PHIvsDAL', 'CLEvsCIN'). Examples: {'games': 'PHIvsDAL', 'match_mode': 'contains_all'}, {'games': ['PHIvsDAL', 'CLEvsCIN'], 'match_mode': 'contains_any'}, or just 'PHIvsDAL'. Match modes: 'contains_all' (default), 'contains_any', 'exact', 'excludes_any'.
     - **sort_by**: Sort the results by one or more fields. Can be a single field as a string or dictionary (default is ascending), or a list of fields and directions as dictionaries (Ex: 'month', ['wins', 'total_games'], {'field': 'win_percentage', 'order': 'desc'}, [{'field': 'win_percentage', 'order': 'desc'}, {'field': 'total_games', 'order': 'desc'}]).
     """
+
+    # Generate cache key from filters
+    cache_key = generate_cache_key(filters.dict())
+    
+    # Try to get from cache first
+    cached_data = get_weekly_trends_from_cache(cache_key)
+    if cached_data is not None:
+        print(f"🎯 CACHE HIT - Weekly trends cache hit for key: {cache_key[:16]}...")
+        return cached_data
 
     query = db.query(WeeklyTrend)
     filters_list = []
@@ -1192,13 +1207,19 @@ def get_trends(filters: WeeklyTrendFilter, db: Session = Depends(get_connection)
 
     if not trends:
         return []
-    return {
+    
+    result = {
         "limit": filters.limit,
         "offset": filters.offset,
         "count": len(trends),
         "total_count": total_count,
         "results": trends,
     }
+    
+    # Cache the result
+    set_weekly_trends_cache(cache_key, result)
+    
+    return result
 
 
 @router.get("/weekly-filter-options", summary="Get available filter options for weekly trends", tags=["WeeklyTrends"])

@@ -2,6 +2,10 @@ from sqlalchemy.orm import Session
 from fastapi import APIRouter, HTTPException, Depends
 from app.models.upcoming_game import UpcomingGame
 from app.database.connection import get_connection
+from app.cache import (
+    get_upcoming_games_from_cache,
+    set_upcoming_games_cache
+)
 
 router = APIRouter()
 
@@ -11,7 +15,14 @@ async def get_upcoming_games(session: Session = Depends(get_connection)):
     Retrieve all upcoming games from the database.
     
     This endpoint returns all games from the upcoming_games table without any filters.
+    Uses caching to improve performance with TTL cache.
     """
+    # Try to get from cache first
+    cached_data = get_upcoming_games_from_cache()
+    if cached_data is not None:
+        print("🎯 CACHE HIT - Upcoming games cache hit")
+        return cached_data
+    
     try:
         # Query all upcoming games from the database
         upcoming_games = session.query(UpcomingGame).all()
@@ -50,10 +61,15 @@ async def get_upcoming_games(session: Session = Depends(get_connection)):
             }
             games_list.append(game_dict)
         
-        return {
+        result = {
             "upcoming_games": games_list,
             "total_count": len(games_list)
         }
+        
+        # Cache the result
+        set_upcoming_games_cache(result)
+        
+        return result
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred while retrieving upcoming games: {str(e)}")
