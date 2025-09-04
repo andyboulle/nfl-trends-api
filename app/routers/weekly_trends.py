@@ -361,14 +361,20 @@ class WeeklyTrendFilter(BaseModel):
     ### DIVISIONAL FILTERS ####
     ###########################
 
-    divisional: Optional[Union[bool, Literal["None"]]] = Field(
+    divisional: Optional[Union[bool, Literal["None"], List[Union[bool, Literal["None"]]]]] = Field(
         None,
-        description="Filter for divisional trends. Can be True, False, or 'None' (as a string to filter for NULL values)."
+        description="Filter for divisional trends. Can be True, False, 'None' (as a string to filter for NULL values), or a list of these values."
     )
 
-    # VALIDATE DIVISIONAL is a boolean or "None"
+    # VALIDATE DIVISIONAL is a boolean, "None", or a list of these
     @validator("divisional", pre=True)
     def validate_divisional(cls, value):
+        if value is None:
+            return None
+        
+        # Handle single values
+        if isinstance(value, bool):
+            return value
         if value == "None":
             return "None"
         if isinstance(value, str):
@@ -376,11 +382,31 @@ class WeeklyTrendFilter(BaseModel):
                 return True
             if value.lower() == "false":
                 return False
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return None
-        raise ValueError("Divisional must be True, False, or 'None' (as a string)")
+            if value == "None":
+                return "None"
+        
+        # Handle lists
+        if isinstance(value, list):
+            validated_list = []
+            for item in value:
+                if isinstance(item, bool):
+                    validated_list.append(item)
+                elif item == "None":
+                    validated_list.append("None")
+                elif isinstance(item, str):
+                    if item.lower() == "true":
+                        validated_list.append(True)
+                    elif item.lower() == "false":
+                        validated_list.append(False)
+                    elif item == "None":
+                        validated_list.append("None")
+                    else:
+                        raise ValueError(f"Invalid divisional value in list: {item}")
+                else:
+                    raise ValueError(f"Invalid divisional value in list: {item}")
+            return validated_list
+        
+        raise ValueError("Divisional must be True, False, 'None' (as a string), or a list of these values")
     
 
     #################################
@@ -939,10 +965,23 @@ def get_trends(filters: WeeklyTrendFilter, db: Session = Depends(get_connection)
             filters_list.append(or_(*conditions))
 
     # Filter by DIVISIONAL
-    if filters.divisional == "None":
-        filters_list.append(WeeklyTrend.divisional.is_(None))
-    elif filters.divisional in (True, False):
-        filters_list.append(WeeklyTrend.divisional == filters.divisional)
+    if filters.divisional is not None:
+        if isinstance(filters.divisional, list):
+            # Handle list of divisional values
+            divisional_conditions = []
+            for div_value in filters.divisional:
+                if div_value == "None":
+                    divisional_conditions.append(WeeklyTrend.divisional.is_(None))
+                elif div_value in (True, False):
+                    divisional_conditions.append(WeeklyTrend.divisional == div_value)
+            if divisional_conditions:
+                filters_list.append(or_(*divisional_conditions))
+        else:
+            # Handle single divisional value
+            if filters.divisional == "None":
+                filters_list.append(WeeklyTrend.divisional.is_(None))
+            elif filters.divisional in (True, False):
+                filters_list.append(WeeklyTrend.divisional == filters.divisional)
 
     # Filter by SPREAD
     if filters.spread:
@@ -1226,10 +1265,7 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
     # Check cache first
     cached_result = get_weekly_filter_options_from_cache()
     if cached_result is not None:
-        print("🎯 CACHE HIT - Weekly filter options cache hit")
         return cached_result
-    
-    print("🔄 CACHE MISS - Fetching weekly filter options from database")
     
     try:
         # Query the database directly for distinct values
@@ -1294,12 +1330,10 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
         
         # Cache the result using the integrated cache system
         set_weekly_filter_options_cache(result)
-        print(f"✅ CACHE SET - Weekly filter options cached with {len(result.get('months', []))} months, {len(result.get('spreads', []))} spreads")
         
         return result
         
     except Exception as e:
-        print(f"❌ ERROR - Failed to fetch weekly filter options: {str(e)}")
         # Return empty lists if there's any error but don't cache the error result
         return {
             "months": [],

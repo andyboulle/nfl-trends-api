@@ -111,9 +111,7 @@ def get_weekly_filter_options_from_cache() -> Optional[Dict]:
     Returns:
         Cached weekly filter options data or None if not found
     """
-    result = weekly_filter_options_cache.get(WEEKLY_FILTER_OPTIONS_KEY)
-    print(f"🔍 CACHE CHECK - Weekly filter options cache lookup: {'HIT' if result is not None else 'MISS'}")
-    return result
+    return weekly_filter_options_cache.get(WEEKLY_FILTER_OPTIONS_KEY)
 
 
 def set_weekly_filter_options_cache(data: Dict) -> None:
@@ -124,7 +122,6 @@ def set_weekly_filter_options_cache(data: Dict) -> None:
         data: The weekly filter options data to cache
     """
     weekly_filter_options_cache[WEEKLY_FILTER_OPTIONS_KEY] = data
-    print(f"💾 CACHE STORE - Weekly filter options stored in cache (size: {len(weekly_filter_options_cache)})")
 
 
 def clear_upcoming_games_cache(preserve_default: bool = True) -> None:
@@ -162,7 +159,6 @@ def clear_weekly_filter_options_cache() -> None:
     Clear weekly filter options cache.
     """
     weekly_filter_options_cache.clear()
-    print(f"🗑️ CACHE CLEAR - Weekly filter options cache cleared (size: {len(weekly_filter_options_cache)})")
 
 
 def get_cache_stats() -> Dict[str, Any]:
