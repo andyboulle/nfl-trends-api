@@ -4,7 +4,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # Load environment variables from .env file
-load_dotenv()
+env_file = ".env.dev" if os.getenv("ENV") == "dev" else ".env.prod"
+load_dotenv(env_file)
 
 # Load database configuration from environment variables
 DB_HOST = os.getenv("DB_HOST")

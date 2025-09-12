@@ -36,34 +36,80 @@ Information about the endpoints and models used can be found in the `docs/` fold
     pip install -r requirements.txt
     ```
 
-## Setup
+## Environment Setup
 
-1. Create a `.env` file for environment variables
+This application uses separate environment files for development and production environments.
+
+### Development Environment
+
+1. Create a `.env.dev` file for development variables
     ```bash
-    touch .env
+    touch .env.dev
     ```
 
-2. Populate your `.env` file with your database configurations
-    ```python
-    DB_HOST=
-    DB_PORT=
-    DB_NAME=
-    DB_USER=
-    DB_PASSWORD=
-    ```
-
-    _EXAMPLE:_
-    ```python
+2. Populate your `.env.dev` file with your local database configuration
+    ```env
     DB_HOST=localhost
     DB_PORT=5432
-    DB_NAME=nfl-trends
+    DB_NAME=nfl-trends-dev
     DB_USER=postgres
     DB_PASSWORD=password
     ```
 
+### Production Environment
+
+1. Create a `.env.prod` file for production variables
+    ```bash
+    touch .env.prod
+    ```
+
+2. Populate your `.env.prod` file with your production database configuration
+    ```env
+    DB_HOST=your-prod-host
+    DB_PORT=5432
+    DB_NAME=nfl-trends-prod
+    DB_USER=your-prod-user
+    DB_PASSWORD=your-prod-password
+    ```
+
+### Environment File Loading
+
+The application loads the appropriate environment file based on the `ENV` environment variable:
+- `ENV=dev` → loads `.env.dev`
+- `ENV=prod` → loads `.env.prod`
+
 ## Execution
 
-1. Start the API server
-    ```bash
-    uvicorn app.main:app --reload
-    ```
+### Development Mode
+Start the API server in development mode (uses `.env.dev`):
+```bash
+export ENV=dev && uvicorn app.main:app --reload
+```
+
+### Production Mode
+
+Start the API server in production mode (uses `.env.prod`):
+
+```bash
+export ENV=prod && uvicorn app.main:app
+```
+
+**Note:** The --reload flag is omitted in production for better performance and security.
+
+## API Documentation
+
+Once the server is running, you can access:
+
+- **Interactive API documentation**: http://localhost:8000/docs
+- **Alternative documentation**: http://localhost:8000/redoc
+
+## Development
+
+The API provides endpoints for:
+
+- NFL game data and results
+- Historical betting trends analysis
+- Upcoming games with current lines
+- Filtering and pagination capabilities
+
+For detailed endpoint documentation and model schemas, refer to the docs folder or visit the interactive documentation when the server is running.
