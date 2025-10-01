@@ -14,6 +14,7 @@ from app.cache import (
     set_weekly_trends_cache,
     set_upcoming_games_cache,
     set_weekly_filter_options_cache,
+    get_weekly_filter_options_from_cache,
     extract_games_from_upcoming_games
 )
 
@@ -24,7 +25,7 @@ async def startup_cache_initialization():
     
     This function:
     1. Fetches upcoming games and caches the result
-    2. Fetches weekly filter options and caches the result
+    2. Fetches weekly filter options from the pre-computed filter_values table (with fallback to DISTINCT queries)
     3. Creates the initial weekly trends query with dynamic games_applicable
     4. Caches the initial weekly trends query result
     """
@@ -36,9 +37,41 @@ async def startup_cache_initialization():
         upcoming_games_result = await get_upcoming_games(db_session)
         set_upcoming_games_cache(upcoming_games_result)
         
-        # Cache weekly filter options
-        weekly_filter_options_result = get_weekly_filter_options(db_session)
-        set_weekly_filter_options_cache(weekly_filter_options_result)
+        # Cache weekly filter options - query filter_values table for optimal performance
+        try:
+            # Try to get filter options from the pre-computed filter_values table
+            from app.models.filter_value import FilterValue
+            import json
+            
+            filter_data = db_session.query(FilterValue).all()
+            
+            if filter_data:
+                # Convert to dictionary for easy lookup
+                filter_dict = {}
+                for row in filter_data:
+                    filter_dict[row.filter_type] = json.loads(row.values_json)
+                
+                filter_options_from_table = {
+                    "categories": filter_dict.get("category", []),
+                    "months": filter_dict.get("month", []),
+                    "day_of_weeks": filter_dict.get("day_of_week", []),
+                    "divisionals": filter_dict.get("divisional", []),
+                    "spreads": filter_dict.get("spread", []),
+                    "totals": filter_dict.get("total", [])
+                }
+                
+                set_weekly_filter_options_cache(filter_options_from_table)
+                print("✅ Using filter_values table for startup cache")
+            else:
+                raise Exception("filter_values table is empty")
+                
+        except Exception as e:
+            print(f"⚠️  Filter_values table not available ({e}), falling back to live query")
+            # Rollback the failed transaction to prevent "InFailedSqlTransaction" errors
+            db_session.rollback()
+            # Fallback to querying the database directly (but only once during startup)
+            weekly_filter_options_result = get_weekly_filter_options(db_session)
+            set_weekly_filter_options_cache(weekly_filter_options_result)
         
         # Extract game strings for weekly trends query
         current_games = extract_games_from_upcoming_games(upcoming_games_result)
@@ -135,7 +168,9 @@ async def startup_cache_initialization():
         
         print("✅ Cache initialization completed successfully")
         print(f"✅ Cached upcoming games: {len(upcoming_games_result.get('upcoming_games', []))} games")
-        print(f"✅ Cached weekly filter options: {len(weekly_filter_options_result.get('months', []))} months, {len(weekly_filter_options_result.get('spreads', []))} spreads, {len(weekly_filter_options_result.get('totals', []))} totals")
+        # Get cached filter options for logging
+        cached_filters = get_weekly_filter_options_from_cache()
+        print(f"✅ Cached weekly filter options: {len(cached_filters.get('months', []))} months, {len(cached_filters.get('spreads', []))} spreads, {len(cached_filters.get('totals', []))} totals")
         print(f"✅ Cached initial weekly trends: {len(initial_result)} trends")
         print(f"✅ Initial weekly trends cache key: {cache_key}")
         

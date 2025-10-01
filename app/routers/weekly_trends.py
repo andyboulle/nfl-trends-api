@@ -1259,7 +1259,7 @@ def get_trends(filters: WeeklyTrendFilter, db: Session = Depends(get_connection)
 def get_weekly_filter_options(db: Session = Depends(get_connection)):
     """
     Get available filter options for weekly trends based on current week's data.
-    Returns the distinct values available in the weekly trends table.
+    Prioritizes the pre-computed filter_values table for performance, with fallback to DISTINCT queries.
     Uses caching to improve performance.
     """
     # Check cache first
@@ -1268,14 +1268,58 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
         return cached_result
     
     try:
-        # Query the database directly for distinct values
-        months = [row[0] for row in db.query(func.distinct(WeeklyTrend.month)).all() if row[0] is not None]
-        day_of_weeks = [row[0] for row in db.query(func.distinct(WeeklyTrend.day_of_week)).all() if row[0] is not None]
-        divisionals = [row[0] for row in db.query(func.distinct(WeeklyTrend.divisional)).all() if row[0] is not None]
-        spreads = [row[0] for row in db.query(func.distinct(WeeklyTrend.spread)).all() if row[0] is not None]
-        totals = [row[0] for row in db.query(func.distinct(WeeklyTrend.total)).all() if row[0] is not None]
+        # Try to get filter options from the pre-computed filter_values table first
+        try:
+            from app.models.filter_value import FilterValue
+            import json
+            
+            filter_data = db.query(FilterValue).all()
+            
+            if filter_data:
+                # Convert to dictionary for easy lookup
+                filter_dict = {}
+                for row in filter_data:
+                    filter_dict[row.filter_type] = json.loads(row.values_json)
+                
+                result = {
+                    "categories": filter_dict.get("category", []),
+                    "months": filter_dict.get("month", []),
+                    "day_of_weeks": filter_dict.get("day_of_week", []),
+                    "divisionals": filter_dict.get("divisional", []),
+                    "spreads": filter_dict.get("spread", []),
+                    "totals": filter_dict.get("total", [])
+                }
+                
+                # Cache the result using the integrated cache system
+                set_weekly_filter_options_cache(result)
+                
+                return result
+            else:
+                raise Exception("filter_values table is empty")
+                
+        except Exception as e:
+            print(f"⚠️  Filter_values table not available ({e}), falling back to DISTINCT queries")
+            # Rollback the failed transaction to prevent "InFailedSqlTransaction" errors
+            db.rollback()
+            
+            # Fallback: Query the database directly for distinct values
+            categories = [row[0] for row in db.query(func.distinct(WeeklyTrend.category)).all() if row[0] is not None]
+            months = [row[0] for row in db.query(func.distinct(WeeklyTrend.month)).all() if row[0] is not None]
+            day_of_weeks = [row[0] for row in db.query(func.distinct(WeeklyTrend.day_of_week)).all() if row[0] is not None]
+            divisionals = [row[0] for row in db.query(func.distinct(WeeklyTrend.divisional)).all() if row[0] is not None]
+            spreads = [row[0] for row in db.query(func.distinct(WeeklyTrend.spread)).all() if row[0] is not None]
+            totals = [row[0] for row in db.query(func.distinct(WeeklyTrend.total)).all() if row[0] is not None]
         
         # Sort the results appropriately
+        category_order = [
+            'home outright', 'away outright', 'favorite outright', 'underdog outright',
+            'home favorite outright', 'away underdog outright', 'away favorite outright', 'home underdog outright',
+            'home ats', 'away ats', 'favorite ats', 'underdog ats',
+            'home favorite ats', 'away underdog ats', 'away favorite ats', 'home underdog ats',
+            'over', 'under'
+        ]
+        categories_sorted = sorted(categories, key=lambda x: category_order.index(x) if x in category_order else 999) if categories else []
+        
         months_sorted = sorted(months, key=lambda x: ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].index(x) if x in ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'] else 999) if months else []
         
         day_of_weeks_sorted = sorted(day_of_weeks, key=lambda x: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].index(x) if x in ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] else 999) if day_of_weeks else []
@@ -1321,6 +1365,7 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
             totals_sorted = or_more_sorted + or_less_sorted
         
         result = {
+            "categories": categories_sorted,
             "months": months_sorted,
             "day_of_weeks": day_of_weeks_sorted,
             "divisionals": divisionals_sorted,
@@ -1336,6 +1381,7 @@ def get_weekly_filter_options(db: Session = Depends(get_connection)):
     except Exception as e:
         # Return empty lists if there's any error but don't cache the error result
         return {
+            "categories": [],
             "months": [],
             "day_of_weeks": [],
             "divisionals": [],

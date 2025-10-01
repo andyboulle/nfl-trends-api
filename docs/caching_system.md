@@ -66,16 +66,28 @@ This ensures:
 On API startup, the system automatically:
 
 1. **Fetches and caches upcoming games** with the protected key
-2. **Fetches and caches weekly filter options** for immediate availability
+2. **Caches weekly filter options** from the `filter_values` table for optimal performance
+   - Queries the pre-computed `filter_values` table once during startup
+   - Falls back to live DISTINCT queries if the table is unavailable
+   - Includes current data (categories, months, day_of_weeks, divisionals, spreads, totals)
+   - Values are updated via daily jobs and stored as JSON in the database
 3. **Extracts current game strings** from upcoming games
 4. **Creates comprehensive initial weekly trends query** with:
    - All major categories (home/away, ats/outright, favorite/underdog, over/under)
-   - Current month filters (September, None)
+   - Current month filters (October, None)
    - Day of week filters (Sunday, Monday, Thursday, Friday, None)
    - Spread and total ranges
    - All available seasons since 2006-2007
    - Dynamic games_applicable section using current games
 5. **Executes and caches the initial query** using the generated hash key
+
+### Performance Optimization
+
+The startup process has been optimized to avoid expensive database operations:
+- **Weekly filter options** are loaded from the pre-computed `filter_values` table
+- This eliminates expensive DISTINCT queries on the weekly_trends table during startup
+- Filter values are kept current through daily job updates and stored as JSON
+- Graceful fallback to live queries if the `filter_values` table is unavailable
 
 ## Cache Management Endpoints
 

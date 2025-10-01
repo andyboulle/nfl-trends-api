@@ -6,6 +6,15 @@ This document provides comprehensive documentation for the SQLAlchemy database m
 
 The API uses SQLAlchemy ORM models to interact with the database, providing type-safe access to NFL game data, trends, and betting information. All models use enum types for consistent data validation and improved query performance.
 
+### Performance Optimizations
+
+The API includes several performance optimizations:
+
+- **Pre-computed Filter Values**: A `filter_values` table stores distinct values for common filters, eliminating expensive DISTINCT queries during API startup
+- **Static Startup Caching**: Weekly filter options use static data during startup instead of live database queries
+- **Intelligent Caching**: Comprehensive caching system with protected entries for frequently accessed data
+- **Batch Processing**: Database operations are optimized with batch inserts and intelligent query planning
+
 ---
 
 ## Database Models
@@ -414,5 +423,47 @@ Each model serializes to JSON with all attributes included, using enum string va
 - **404**: Record not found
 - **422**: Validation error (invalid enum values, etc.)
 - **500**: Database connection or query errors
+
+---
+
+### 6. FilterValue Model
+
+**File**: `app/models/filter_value.py`  
+**Table**: `filter_values`  
+**Purpose**: Performance optimization table storing pre-computed distinct values for API filter options.
+
+#### Schema Definition
+
+```python
+class FilterValue(Base):
+    __tablename__ = 'filter_values'
+```
+
+#### Attributes
+
+##### Primary Identification
+- **`filter_type`** (`String(50)`, Primary Key): Type of filter (column name from weekly_trends)
+- **`values_json`** (`String`, Required): JSON-encoded array of sorted distinct values
+- **`last_updated`** (`DateTime`, Nullable): Timestamp of last update
+
+#### Usage
+
+This model is used internally for performance optimization:
+- **Updated by**: Daily jobs (`daily_jobs.py`)
+- **Read by**: Weekly filter options endpoint
+- **Purpose**: Eliminates expensive DISTINCT queries during API operations
+- **Data source**: Computed from `weekly_trends` table
+
+#### Filter Types
+
+Available filter types and their content:
+- **`category`**: All betting categories (home ats, away outright, etc.)
+- **`month`**: Available months (October, November, etc.)
+- **`day_of_week`**: Available days (Sunday, Monday, Thursday, etc.)
+- **`divisional`**: Boolean values [true, false]
+- **`spread`**: All spread values and ranges
+- **`total`**: All total values and ranges
+
+---
 
 This documentation provides complete reference for all database models used by the NFL Trends API, including their structure, relationships, and usage patterns.
