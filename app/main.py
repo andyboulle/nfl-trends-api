@@ -6,14 +6,21 @@ from app.routers import game_trends
 from app.routers import weekly_trends
 from app.routers import upcoming_games
 from app.routers import cache_management
+from app.routers import email_subscriptions
 from app.startup import startup_cache_initialization
+from app.database.connection import engine, Base
+from app.models.email_subscription import EmailSubscription
 
 app = FastAPI()
 
 # Add startup event handler for cache initialization
 @app.on_event("startup")
 async def startup_event():
-    """Initialize caches on application startup."""
+    """Initialize caches and create database tables on application startup."""
+    # Create database tables
+    Base.metadata.create_all(bind=engine)
+    
+    # Initialize caches
     await startup_cache_initialization()
 
 # Add CORS middleware
@@ -24,6 +31,8 @@ app.add_middleware(
         "http://127.0.0.1:3000", 
         "http://localhost:5173", 
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "https://nfl-trends-ui.vercel.app",
         "https://www.nfltrend.com"
     ],
@@ -38,6 +47,7 @@ app.include_router(upcoming_games.router, prefix='/api/v1')
 app.include_router(weekly_trends.router, prefix='/api/v1')
 app.include_router(game_trends.router, prefix="/api/v1/trends")
 app.include_router(cache_management.router, prefix='/api/v1')
+app.include_router(email_subscriptions.router, prefix='/api/v1')
 
 @app.get('/')
 def read_root():

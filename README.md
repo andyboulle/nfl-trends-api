@@ -110,6 +110,7 @@ The API provides endpoints for:
 - NFL game data and results
 - Historical betting trends analysis
 - Upcoming games with current lines
+- Email subscription management
 - Filtering and pagination capabilities
 
 For detailed endpoint documentation and model schemas, refer to the docs folder or visit the interactive documentation when the server is running.
